@@ -3,14 +3,37 @@ import { SearchDTO, SearchSuggestionDTO } from './dto/search.dto';
 import { SearchResponseDto } from './dto/search-response.dto';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
-import { sql } from 'kysely';
+import { sql, SqlBool, RawBuilder } from 'kysely';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const tsquery = require('pg-tsquery')();
+/**
+ * Build a PGroonga query (`&@~` query syntax) from raw user input.
+ *
+ * - Multi-character terms are wrapped in double quotes (phrase match), which
+ *   both escapes PGroonga query syntax characters and keeps the original
+ *   `pg-tsquery`-style behavior. Terms are combined with AND semantics
+ *   (PGroonga treats whitespace as AND in query syntax).
+ * - Single-character terms are NOT included here: under the bigram tokenizer
+ *   a lone CJK character is not a token (and `word*` only matches the start
+ *   of the document text), so they are matched via LIKE substring matching
+ *   instead (see `buildSingleCharLikeClause`), which PGroonga also accelerates.
+ */
+function buildPgroongaQuery(input: string): string {
+  return input
+    .trim()
+    .split(/\s+/)
+    .filter((word) => word.length > 1)
+    .map((word) => `"${word.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`)
+    .join(' ');
+}
+
+/** Escape LIKE wildcards so user input is matched literally. */
+function escapeLike(input: string): string {
+  return input.replace(/[\\%_]/g, (m) => `\\${m}`);
+}
 
 @Injectable()
 export class SearchService {
@@ -31,10 +54,50 @@ export class SearchService {
   ): Promise<{ items: SearchResponseDto[] }> {
     const { query } = searchParams;
 
-    if (query.length < 1) {
+    if (query.trim().length < 1) {
       return { items: [] };
     }
-    const searchQuery = tsquery(query.trim() + '*');
+    const terms = query.trim().split(/\s+/).filter(Boolean);
+    const searchQuery = buildPgroongaQuery(query);
+    const highlightKeywords = terms;
+    const singleCharPatterns = terms
+      .filter((term) => term.length === 1)
+      .map((term) => `%${escapeLike(term)}%`);
+
+    // PGroonga full-text match for multi-char terms
+    const pgroongaClause = searchQuery
+      ? sql<SqlBool>`(title &@~ ${searchQuery} OR text_content &@~ ${searchQuery})`
+      : null;
+    // LIKE substring fallback for single-char terms (bigram tokenizer cannot
+    // index a lone CJK character). PGroonga accelerates these LIKE queries.
+    const singleCharClause = singleCharPatterns.length
+      ? sql<SqlBool>`(${sql.join(
+          singleCharPatterns.map(
+            (p) =>
+              sql<SqlBool>`(title LIKE ${p} ESCAPE '\\' OR text_content LIKE ${p} ESCAPE '\\')`,
+          ),
+          sql` AND `,
+        )})`
+      : null;
+
+    const fullTextClause =
+      pgroongaClause && singleCharClause
+        ? sql<SqlBool>`(${pgroongaClause} OR ${singleCharClause})`
+        : (pgroongaClause ?? singleCharClause)!;
+
+    // Title-match bonus (mirrors the old ts_rank A/B weighting)
+    const titleBonusClause =
+      pgroongaClause && singleCharClause
+        ? sql`(title &@~ ${searchQuery} OR ${sql.join(
+            singleCharPatterns.map((p) => sql`title LIKE ${p} ESCAPE '\\'`),
+            sql` OR `,
+          )})`
+        : pgroongaClause
+          ? sql`title &@~ ${searchQuery}`
+          : sql`(${sql.join(
+              singleCharPatterns.map((p) => sql`title LIKE ${p} ESCAPE '\\'`),
+              sql` OR `,
+            )})`;
 
     let queryResults = this.db
       .selectFrom('pages')
@@ -47,18 +110,14 @@ export class SearchService {
         'creatorId',
         'createdAt',
         'updatedAt',
-        sql<number>`ts_rank(tsv, to_tsquery('english', f_unaccent(${searchQuery})))`.as(
+        sql<number>`(pgroonga_score(pages.tableoid, pages.ctid) + CASE WHEN ${titleBonusClause} THEN 1000 ELSE 0 END)`.as(
           'rank',
         ),
-        sql<string>`ts_headline('english', text_content, to_tsquery('english', f_unaccent(${searchQuery})),'MinWords=9, MaxWords=10, MaxFragments=3')`.as(
+        sql<string>`COALESCE(array_to_string(pgroonga_snippet_html(text_content, ${highlightKeywords}), ' ... '), '')`.as(
           'highlight',
         ),
       ])
-      .where(
-        'tsv',
-        '@@',
-        sql<string>`to_tsquery('english', f_unaccent(${searchQuery}))`,
-      )
+      .where(fullTextClause)
       .$if(Boolean(searchParams.creatorId), (qb) =>
         qb.where('creatorId', '=', searchParams.creatorId),
       )
@@ -141,7 +200,11 @@ export class SearchService {
     //@ts-ignore
     const searchResults = results.map((result: SearchResponseDto) => {
       if (result.highlight) {
+        // pgroonga_snippet_html emits <span class="keyword">, which the client
+        // DOMPurify whitelist strips — convert to <mark> for highlighting.
         result.highlight = result.highlight
+          .replace(/<span class="keyword">/g, '<mark>')
+          .replace(/<\/span>/g, '</mark>')
           .replace(/\r\n|\r|\n/g, ' ')
           .replace(/\s+/g, ' ');
       }
