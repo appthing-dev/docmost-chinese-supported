@@ -1,0 +1,139 @@
+name: build
+
+on:
+  schedule:
+    # 每天 03:00 UTC = 北京时间 11:00
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "忽略上游检查, 强制重新构建"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 需要完整历史以合并上游 docmost 的更新
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 检查上游更新
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          force="${{ inputs.force || 'false' }}"
+          need=false
+
+          [ "$force" = "true" ] && need=true
+          # 手动改了 Dockerfile / workflow 推上来 -> 总是重建
+          [ "${{ github.event_name }}" = "push" ] && need=true
+
+          # 上次构建时同步的上游 commit
+          last_sha=""
+          if [ -f versions.txt ]; then
+            last_sha="$(grep -E '^UPSTREAM_SHA=' versions.txt | cut -d= -f2 || true)"
+          fi
+
+          # 获取上游 docmost main 最新 commit
+          upstream_sha="$(git ls-remote https://github.com/docmost/docmost.git refs/heads/main | cut -f1)"
+          echo "上游 docmost main: $upstream_sha (上次构建: ${last_sha:-none})"
+
+          if [ -z "$upstream_sha" ]; then
+            echo "::error::无法读取上游 docmost 的 commit, 中止"
+            exit 1
+          fi
+
+          # 上游有更新 -> 合并到本分支 (保留 pgroonga 中文搜索修改)
+          if [ "$upstream_sha" != "$last_sha" ]; then
+            echo "检测到上游更新, 合并 docmost/main"
+            git remote add upstream https://github.com/docmost/docmost.git
+            git fetch upstream main
+            if git merge --no-edit upstream/main; then
+              echo "上游合并成功"
+            else
+              echo "::error::合并上游 main 发生冲突, 请手动处理 (git fetch upstream && git merge upstream/main)"
+              exit 1
+            fi
+            need=true
+          fi
+
+          # 上游最新版本号 (release tag)
+          version="$(curl -fsSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            'https://api.github.com/repos/docmost/docmost/releases/latest' \
+            | jq -r '.tag_name // empty')"
+          echo "上游最新版本: ${version:-unknown}"
+
+          echo "need_build=$need"
+          echo "need_build=$need" >> "$GITHUB_OUTPUT"
+          echo "UPSTREAM_SHA=$upstream_sha" >> "$GITHUB_ENV"
+          echo "VERSION=${version:-latest}" >> "$GITHUB_ENV"
+
+      - name: 上游无更新, 跳过
+        if: steps.check.outputs.need_build == 'false'
+        run: echo "上游 docmost 无更新, 无需重新构建"
+
+      - name: Login to GHCR
+        if: steps.check.outputs.need_build == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.check.outputs.need_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+          provenance: false
+          push: true
+
+      - name: 更新 versions.txt
+        if: steps.check.outputs.need_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > versions.txt <<EOF
+          # docmost-chinese-supported 构建记录 (由 GitHub Actions 自动更新, 请勿手改)
+          # UPSTREAM_SHA = 本次构建时 docmost/docmost main 的 commit
+          UPSTREAM_SHA=${{ env.UPSTREAM_SHA }}
+          VERSION=${{ env.VERSION }}
+          EOF
+          if git diff --quiet versions.txt; then
+            echo "versions.txt 内容无变化, 跳过提交"
+            exit 0
+          fi
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.txt
+          git commit -m "chore: sync upstream ${{ env.VERSION }} (${{ env.UPSTREAM_SHA }})"
+          git push

@@ -1,0 +1,4 @@
+# docmost-chinese-supported 构建记录 (由 GitHub Actions 自动更新, 请勿手改)
+# UPSTREAM_SHA = 本次构建时 docmost/docmost main 的 commit
+UPSTREAM_SHA=56ac42767a575ded03f98a4e70d6373e3b59af7c
+VERSION=v0.95.0
