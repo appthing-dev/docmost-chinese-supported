@@ -1,5 +1,6 @@
 FROM node:26-slim AS base
 LABEL org.opencontainers.image.source="https://github.com/docmost/docmost"
+# trigger-ci: registry access updated on GHCR package
 
 # CN mirrors for faster downloads (Tsinghua npm mirror was retired — TUNA
 # now points to npmmirror; pypi mirror is still on Tsinghua).
